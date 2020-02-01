@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020 Oracle and/or its affiliates. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -231,7 +231,7 @@ public class SingleTest {
     public void testMapMany() {
         SingleTestSubscriber<String> subscriber = new SingleTestSubscriber<>();
         Single.just("f.o.o")
-                .mapMany((str) -> new TestPublisher<>(str.split("\\.")))
+                .mapMany((str) ->  new TestPublisher<>(str.split("\\.")))
                 .subscribe(subscriber);
         assertThat(subscriber.isComplete(), is(equalTo(true)));
         assertThat(subscriber.getLastError(), is(nullValue()));
