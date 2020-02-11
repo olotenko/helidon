@@ -54,9 +54,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * @param <U> published type (output)
  */
 public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscription {
-
     private volatile boolean complete;
-    private volatile boolean cancelled;
     private Throwable error;
     private Subscriber<? super U> subscriber;
     private Thread nexting;
@@ -89,6 +87,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
      * @param ex Exception to complete exceptionally with
      */
     protected void complete(Throwable ex) {
+        cancel();
         if (Objects.nonNull(ex)) {
             subscriber.onError(ex);
         } else {
@@ -120,6 +119,8 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
             request = 0;
             // in a chain of BaseProcessors this will be just one stack frame
             subscription.request(req);
+        } else if (request < 0) {
+            complete(error);
         }
         nexting = null;
     }
@@ -219,10 +220,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
 
     @Override
     public void onNext(T item) {
-        if (!cancelled) {
-            if (complete) {
-                throw new IllegalStateException("Subscription already cancelled!");
-            }
+        if (!complete) {
             next(item);
         }
     }
@@ -235,8 +233,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
      */
     @Override
     public void request(long n) {
-        StreamValidationUtils.checkRequestParam(n, this::onError);
-        if (cancelled) {
+        if (complete) {
             return;
         }
         // this is not required to be in sync with any changes to complete,
@@ -249,6 +246,14 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
         // (otherwise it will be 2x the chain of Processors - 1x for the chain of onNext,
         // another 1x for the chain of request())
         if (nexting != null && nexting == Thread.currentThread()) {
+            if (n <= 0 || request < 0) {
+                if (request >= 0) {
+                   request = -1;
+                   this.error = new IllegalArgumentException("Expecting positive requests, found " + n);
+                }
+                return;
+            }
+
             if (Long.MAX_VALUE - request > n) {
                 request += n;
             } else {
@@ -262,7 +267,6 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
 
     @Override
     public void cancel() {
-        cancelled = true;
         complete = true;
         subscription.cancel();
     }
