@@ -55,30 +55,18 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
     public void subscribe(Flow.Subscriber<? super T> subscriber) {
         boolean contended = trampolineLock.getAndSet(true);
 
-        boolean complete;
-        try {
-            if (contended || this.subscriber != null) {
-                if (!contended) {
-                    trampolineLock.set(false);
-                    trySubmit();
-                }
-                throw new IllegalStateException("This Publisher supports only one Subscriber");
+        if (contended || this.subscriber != null) {
+            if (!contended) {
+                trampolineLock.set(false);
+                trySubmit();
             }
-            complete = !iterator.hasNext();
-        } catch (Throwable t) {
-            subscriber.onSubscribe(new Flow.Subscription() {
-                public void request(long n) {}
-                public void cancel() {}
-            });
-            subscriber.onError(t);
+
+            subscriber.onSubscribe(EmptySubscription.INSTANCE);
+            subscriber.onError(new IllegalStateException("This Publisher supports only one Subscriber"));
             return;
         }
 
         subscriber.onSubscribe(this);
-        if (complete) {
-           subscriber.onComplete();
-           return;
-        }
         this.subscriber = subscriber;
         trampolineLock.set(false);
         trySubmit();
@@ -105,19 +93,22 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
     }
 
     private void trySubmit() {
-        while(requestCounter.get() != 0) {
+        long r;
+        while((r = requestCounter.get()) != 0) {
             if (trampolineLock.get() || trampolineLock.getAndSet(true)) {
                 return;
             }
 
             try {
-                while (requestCounter.getAndDecrement() > 0 && iterator.hasNext()) {
+                boolean hasNext;
+                while ((hasNext = iterator.hasNext()) && r > 0) {
                     T next = iterator.next();
                     Objects.requireNonNull(next);
                     subscriber.onNext(next);
+                    r = requestCounter.decrementAndGet();
                 }
 
-                if (requestCounter.get() < 0) {
+                if (r < 0) {
                     // cancel or error
                     if (error != null) {
                         throw error;
@@ -125,7 +116,7 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
                     return;
                 }
 
-                if (!iterator.hasNext()) {
+                if (!hasNext) {
                    subscriber.onComplete();
                    return;
                 }
