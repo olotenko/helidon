@@ -21,6 +21,7 @@ package io.helidon.common.reactive;
  * @param <T> item type
  */
 final class MultiFirstProcessor<T> extends BaseProcessor<T, T> implements Single<T> {
+    boolean requested;
 
     private MultiFirstProcessor() {
     }
@@ -29,9 +30,18 @@ final class MultiFirstProcessor<T> extends BaseProcessor<T, T> implements Single
         return new MultiFirstProcessor<>();
     }
 
-    @Override
-    protected void next(T item) {
-        super.next(item);
-        super.complete();
+    protected void submit(T item) {
+        subscriber.onNext(item);
+        onComplete(); // this cancels upstream subscription, too
+    }
+
+    public void request(long n) {
+        if (requested) {
+            return;
+        }
+        // it's ok if this is not volatile - requesting more than one is not a failure,
+        // it's simply futile
+        requested = true;
+        super.request(1);
     }
 }

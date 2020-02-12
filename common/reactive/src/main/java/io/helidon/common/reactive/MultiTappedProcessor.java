@@ -142,7 +142,7 @@ public class MultiTappedProcessor<R> extends BaseProcessor<R, R> implements Mult
     }
 
     @Override
-    public void onNext(R item) {
+    protected void submit(R item) {
         R value;
         try {
             value = onNextFunction.map(f -> f.apply(item)).orElse(item);
@@ -150,26 +150,26 @@ public class MultiTappedProcessor<R> extends BaseProcessor<R, R> implements Mult
             super.onError(t);
             return;
         }
-        super.onNext(value);
+        subscriber.onNext(value);
     }
 
     @Override
-    public void onError(Throwable error) {
-        try {
-            onErrorConsumer.ifPresent(c -> c.accept(error));
-        } catch (Throwable t) {
-            error.addSuppressed(t);
+    protected void complete(Throwable error) {
+        if (error != null) {
+            try {
+                Throwable err = error;
+                onErrorConsumer.ifPresent(c -> c.accept(err));
+            } catch (Throwable t) {
+                error.addSuppressed(t);
+            }
+        } else {
+            try {
+                onCompleteRunnable.ifPresent(Runnable::run);
+            } catch (Throwable t) {
+                error = t;
+            }
         }
-        super.onError(error);
-    }
 
-    @Override
-    public void onComplete() {
-        try {
-            onCompleteRunnable.ifPresent(Runnable::run);
-            super.onComplete();
-        } catch (Throwable t) {
-            super.onError(t);
-        }
+        super.complete(error);
     }
 }

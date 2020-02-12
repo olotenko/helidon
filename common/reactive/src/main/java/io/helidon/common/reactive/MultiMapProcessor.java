@@ -49,21 +49,17 @@ public final class MultiMapProcessor<T, U> extends BaseProcessor<T, U> implement
     }
 
     @Override
-    @SuppressWarnings("unchecked")
-    protected void submit(T item, Flow.Subscriber<? super U> subscriber) {
+    protected void submit(T item) {
         U value = null;
         try {
             value = mapper.map(item);
+            if (value == null) {
+                throw new NullPointerException("Mapper returned a null value");
+            }
         } catch (Throwable t) {
-            getSubscription().cancel();
             onError(t);
             return;
         }
-        if (value == null) {
-            getSubscription().cancel();
-            onError(new NullPointerException("Mapper returned a null value"));
-            return;
-        }
-        subscriber.onNext((U) value);
+        subscriber.onNext(value);
     }
 }

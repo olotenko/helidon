@@ -56,7 +56,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscription {
     private volatile boolean complete;
     private Throwable error;
-    private Subscriber<? super U> subscriber;
+    protected Subscriber<? super U> subscriber;
     private Thread nexting;
     private long request;
     private volatile Subscription subscription;
@@ -91,7 +91,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
         if (Objects.nonNull(ex)) {
             subscriber.onError(ex);
         } else {
-            this.complete();
+            subscriber.onComplete();
         }
     }
 
@@ -99,7 +99,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
      * Complete by sending onComplete signal to down stream.
      */
     protected void complete() {
-        subscriber.onComplete();
+        complete(null);
     }
 
     /**
@@ -112,7 +112,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
         nexting = Thread.currentThread();
         request = 0;
 
-        submit(item, subscriber);
+        submit(item);
 
         if (request > 0) {
             long req = request;
@@ -126,15 +126,11 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
     }
 
     /**
-     * Invoke actual onNext signal to down stream.
+     * Subclasses should convert T to U and invoke actual onNext signal to down stream.
      *
      * @param item       to be sent down stream
-     * @param subscriber subscriber to sent onNext signal to
      */
-    @SuppressWarnings("unchecked")
-    protected void submit(T item, Subscriber<? super U> subscriber) {
-        subscriber.onNext((U) item);
-    }
+    protected abstract void submit(T item);
 
     @Override
     public void subscribe(Subscriber<? super U> s) {
@@ -144,6 +140,7 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
             if (subscriber != null) {
                 subscriber.onSubscribe(EmptySubscription.INSTANCE);
                 subscriber.onError(new IllegalStateException("This Publisher accepts only one Subscriber"));
+                return;
             }
             if (s instanceof Subscribable) {
                 subscriber = s;
@@ -245,12 +242,17 @@ public abstract class BaseProcessor<T, U> implements Processor<T, U>, Subscripti
         // then postpone requesting until after next(...) - this will tame the recursion
         // (otherwise it will be 2x the chain of Processors - 1x for the chain of onNext,
         // another 1x for the chain of request())
-        if (nexting != null && nexting == Thread.currentThread()) {
-            if (n <= 0 || request < 0) {
-                if (request >= 0) {
-                   request = -1;
-                   this.error = new IllegalArgumentException("Expecting positive requests, found " + n);
-                }
+        if (nexting == Thread.currentThread()) {
+            // nexting is not volatile; but the only way nexting == Thread.currentThread()
+            // is only if request() is invoked by the same thread. Any racy writes by any
+            // other thread cannot make the value Thread.currentThread() visible.
+            if (request < 0) {
+                return;
+            }
+
+            if (n <= 0) {
+                request = -1;
+                this.error = new IllegalArgumentException("Expecting positive requests, found " + n);
                 return;
             }
 

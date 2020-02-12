@@ -239,5 +239,9 @@ public class BaseProcessorTest {
             error = ex;
             super.onError(ex);
         }
+
+        protected void submit(T item) {
+            subscriber.onNext(item);
+        }
     }
 }

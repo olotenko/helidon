@@ -33,30 +33,49 @@ final class MultiCollectingProcessor<T, U> extends BaseProcessor<T, U> implement
     }
 
     @Override
-    protected void next(T item) {
+    protected void submit(T item) {
         try {
             collector.collect(item);
         } catch (Throwable t) {
+            // guarantee that the collector will receive all items produced by upstream,
+            // even if it keeps failing
             super.setError(t);
         }
     }
 
     @Override
-    public void onComplete() {
+    protected void complete(Throwable ex) {
+        if (ex != null) {
+            super.complete(ex);
+            return;
+        }
+
         U value;
         try {
+            // guarantee collector will always get value() called, if upstream did not fail
+            // and subscription was not cancelled
             value = collector.value();
+
+            if (getError() != null) {
+                super.complete(getError());
+                return;
+            }
+
+            // require collector to return non-null value(), if there were no errors collecting
+            if (value == null) {
+                throw new NullPointerException("Collector returned a null container");
+            }
         } catch (Throwable t) {
             super.complete(t);
             return;
         }
-        if (value == null) {
-            super.onError(new IllegalStateException("Collector returned a null container"));
-        } else if (getError() != null) {
-            super.complete(getError());
-        } else {
-            getSubscriber().onNext(value);
-            super.complete();
-        }
+        subscriber.onNext(value);
+        subscriber.onComplete();
+    }
+
+    @Override
+    public void request(long n) {
+        // downstream is not expected to request more than one
+        super.request(Long.MAX_VALUE);
     }
 }
