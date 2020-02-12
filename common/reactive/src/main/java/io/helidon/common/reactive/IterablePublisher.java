@@ -21,22 +21,22 @@ import java.util.Iterator;
 import java.util.Objects;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Publisher from iterable, implemented as trampoline stack-less recursion.
  *
  * @param <T> item type
  */
-class IterablePublisher<T> implements Flow.Publisher<T> {
-    private Iterable<T> iterable;
-    private AtomicBoolean cancelled = new AtomicBoolean(false);
-    private AtomicBoolean completed = new AtomicBoolean(false);
-    private AtomicBoolean trampolineLock = new AtomicBoolean(false);
-    private final RequestedCounter requestCounter = new RequestedCounter();
-    private final ReentrantLock iterateConcurrentLock = new ReentrantLock();
+class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
+    private final Iterator<T> iterator;
+    private final AtomicBoolean trampolineLock = new AtomicBoolean(false);
+    private final AtomicLong requestCounter = new AtomicLong(0);
+    private Throwable error;
+    private Flow.Subscriber<? super T> subscriber;
 
-    private IterablePublisher() {
+    private IterablePublisher(Iterator<T> it) {
+        iterator = it;
     }
 
     /**
@@ -47,62 +47,98 @@ class IterablePublisher<T> implements Flow.Publisher<T> {
      * @return new instance of {@link IterablePublisher}
      */
     static <T> IterablePublisher<T> create(Iterable<T> iterable) {
-        IterablePublisher<T> instance = new IterablePublisher<>();
-        instance.iterable = iterable;
+        IterablePublisher<T> instance = new IterablePublisher<>(iterable.iterator());
         return instance;
     }
 
     @Override
     public void subscribe(Flow.Subscriber<? super T> subscriber) {
-        final Iterator<T> iterator;
+        boolean contended = trampolineLock.getAndSet(true);
+
+        boolean complete;
         try {
-            iterator = iterable.iterator();
+            if (contended || this.subscriber != null) {
+                if (!contended) {
+                    trampolineLock.set(false);
+                    trySubmit();
+                }
+                throw new IllegalStateException("This Publisher supports only one Subscriber");
+            }
+            complete = !iterator.hasNext();
         } catch (Throwable t) {
+            subscriber.onSubscribe(new Flow.Subscription() {
+                public void request(long n) {}
+                public void cancel() {}
+            });
             subscriber.onError(t);
             return;
         }
-        subscriber.onSubscribe(new Flow.Subscription() {
-            @Override
-            public void request(long n) {
-                requestCounter.increment(n, subscriber::onError);
-                trySubmit();
-            }
 
-            private void trySubmit() {
-                if (!trampolineLock.getAndSet(true)) {
-                    try {
-                        while (requestCounter.tryDecrement()) {
-                            iterateConcurrentLock.lock();
-                            try {
-                                if (iterator.hasNext() && !cancelled.get()) {
-                                    T next = iterator.next();
-                                    Objects.requireNonNull(next);
-                                    subscriber.onNext(next);
-                                    if (!iterator.hasNext() && !completed.getAndSet(true)) {
-                                        subscriber.onComplete();
-                                        break;
-                                    }
-                                } else {
-                                    if (!completed.getAndSet(true)) {
-                                        subscriber.onComplete();
-                                    }
-                                    break;
-                                }
-                            } finally {
-                                iterateConcurrentLock.unlock();
-                            }
-                        }
-                    } finally {
-                        trampolineLock.set(false);
-                    }
-                }
-            }
-
-            @Override
-            public void cancel() {
-                cancelled.set(true);
-            }
-        });
+        subscriber.onSubscribe(this);
+        if (complete) {
+           subscriber.onComplete();
+           return;
+        }
+        this.subscriber = subscriber;
+        trampolineLock.set(false);
+        trySubmit();
     }
 
+    @Override
+    public void request(long n) {
+        if (n <= 0) {
+           error = new IllegalArgumentException("Expecting positive request, got " + n);
+           requestCounter.getAndSet(-1);
+           trySubmit();
+           return;
+        }
+
+        long r;
+        do {
+           r = requestCounter.get();
+           if (r < 0) {
+              return;
+           }
+        } while(!requestCounter.compareAndSet(r, Long.MAX_VALUE - r > n ? r + n: Long.MAX_VALUE));
+
+        trySubmit();
+    }
+
+    private void trySubmit() {
+        while(requestCounter.get() != 0) {
+            if (trampolineLock.get() || trampolineLock.getAndSet(true)) {
+                return;
+            }
+
+            try {
+                while (requestCounter.getAndDecrement() > 0 && iterator.hasNext()) {
+                    T next = iterator.next();
+                    Objects.requireNonNull(next);
+                    subscriber.onNext(next);
+                }
+
+                if (requestCounter.get() < 0) {
+                    // cancel or error
+                    if (error != null) {
+                        throw error;
+                    }
+                    return;
+                }
+
+                if (!iterator.hasNext()) {
+                   subscriber.onComplete();
+                   return;
+                }
+            } catch (Throwable th) {
+                subscriber.onError(th);
+                return;
+            }
+            trampolineLock.set(false);
+        }
+    }
+
+    @Override
+    public void cancel() {
+        requestCounter.getAndSet(-1);
+    }
 }
