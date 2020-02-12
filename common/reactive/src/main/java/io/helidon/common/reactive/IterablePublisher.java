@@ -46,8 +46,13 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
      * @param <T>      Item type
      * @return new instance of {@link IterablePublisher}
      */
-    static <T> IterablePublisher<T> create(Iterable<T> iterable) {
-        IterablePublisher<T> instance = new IterablePublisher<>(iterable.iterator());
+    static <T> Flow.Publisher<T> create(Iterable<T> iterable) {
+        Flow.Publisher<T> instance;
+        try {
+            instance = new IterablePublisher<>(iterable.iterator());
+        } catch(Throwable th) {
+            instance = MultiError.create(th);
+        }
         return instance;
     }
 

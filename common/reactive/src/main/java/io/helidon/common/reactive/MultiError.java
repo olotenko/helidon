@@ -40,17 +40,7 @@ final class MultiError<T> implements Multi<T> {
 
     @Override
     public void subscribe(Subscriber<? super T> subscriber) {
-        subscriber.onSubscribe(new Flow.Subscription() {
-            @Override
-            public void request(long n) {
-                subscriber.onError(error);
-            }
-
-            @Override
-            public void cancel() {
-
-            }
-        });
+        subscriber.onSubscribe(EmptySubscription.INSTANCE);
         subscriber.onError(error);
     }
 }
