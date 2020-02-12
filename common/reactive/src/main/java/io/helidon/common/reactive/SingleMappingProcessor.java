@@ -15,8 +15,7 @@
  */
 package io.helidon.common.reactive;
 
-import java.util.Objects;
-import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.helidon.common.mapper.Mapper;
 
@@ -27,21 +26,25 @@ import io.helidon.common.mapper.Mapper;
  * @param <T> subscribed type
  * @param <U> published type
  */
-final class SingleMappingProcessor<T, U> extends BaseProcessor<T, U> implements Single<U> {
-
-    private final Mapper<T, U> mapper;
+class SingleMappingProcessor<T, U> extends MapProcessor<T, U> implements Single<U> {
+    private final AtomicBoolean requested = new AtomicBoolean(false);
 
     SingleMappingProcessor(Mapper<T, U> mapper) {
-        this.mapper = Objects.requireNonNull(mapper, "mapper is null!");
+        super(mapper);
     }
 
     @Override
-    protected void submit(T item) {
-        U value = mapper.map(item);
-        if (value == null) {
-            onError(new IllegalStateException("Mapper returned a null value"));
+    public void request(long n) {
+        // just making sure this Processor requests one and only one
+        if (requested.get() || requested.getAndSet(true)) {
             return;
         }
-        subscriber.onNext(value);
+
+        super.request(1);
+    }
+
+    protected void submit(T item) {
+        super.submit(item);
+        complete();
     }
 }

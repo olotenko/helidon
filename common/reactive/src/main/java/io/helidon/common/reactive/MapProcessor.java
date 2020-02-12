@@ -27,25 +27,26 @@ import io.helidon.common.mapper.Mapper;
  * @param <T> subscribed type
  * @param <U> published type
  */
-public final class MultiMapProcessor<T, U> extends MapProcessor<T, U> implements Multi<U> {
-    private MultiMapProcessor(Mapper<T, U> mapper) {
-        super(mapper);
+public class MapProcessor<T, U> extends BaseProcessor<T, U> {
+    private final Mapper<T, U> mapper;
+
+    protected MapProcessor(Mapper<T, U> mapper) {
+        super();
+        this.mapper = Objects.requireNonNull(mapper, "mapper is null!");
     }
 
-    /**
-     * Processor of {@link Publisher} to {@link Single} that publishes and maps each received item.
-     *
-     * @param mapper supplied for all items to be mapped with
-     * @param <T>    subscribed type
-     * @param <U>    published type
-     * @return {@link MultiMapProcessor}
-     */
-    public static <T, U> MultiMapProcessor<T, U> create(Mapper<T, U> mapper) {
-        return new MultiMapProcessor<T, U>(mapper);
-    }
-
+    @Override
     protected void submit(T item) {
-        super.submit(item);
-        complete();
+        U value = null;
+        try {
+            value = mapper.map(item);
+            if (value == null) {
+                throw new NullPointerException("Mapper returned a null value");
+            }
+        } catch (Throwable t) {
+            onError(t);
+            return;
+        }
+        subscriber.onNext(value);
     }
 }

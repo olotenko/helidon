@@ -15,26 +15,13 @@
  */
 package io.helidon.common.reactive;
 
-import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Processor of {@code Publisher<T>} to {@code Single<T>} expecting exactly one item.
  *
  * @param <T> item type
  */
-final class SingleExactlyOneProcessor<T> extends BaseProcessor<T, T> implements Single<T> {
-    private final AtomicBoolean requested = new AtomicBoolean(false);
-
-    @Override
-    public void request(long n) {
-        // just making sure this Processor requests one and only one
-        if (requested.get() || requested.getAndSet(true)) {
-            return;
-        }
-
-        super.request(1);
-    }
-
-    protected void submit(T item) {
-        subscriber.onNext(item);
+final class SingleExactlyOneProcessor<T> extends SingleMappingProcessor<T, T> {
+    public SingleExactlyOneProcessor() {
+        super(item -> item);
     }
 }
