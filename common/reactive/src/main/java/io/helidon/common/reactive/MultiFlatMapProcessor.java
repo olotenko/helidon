@@ -21,6 +21,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
@@ -30,20 +32,36 @@ import java.util.function.Function;
  * @param <T> input item type
  * @param <X> output item type
  */
-public class MultiFlatMapProcessor<T, X> implements Flow.Processor<T, X>, Multi<X> {
+public class MultiFlatMapProcessor<T, X> extends BaseProcessor<T, X> implements Multi<X> {
+    private static final int INNER_COMPLETE = 1;
+    private static final int OUTER_COMPLETE = 2;
+    private static final int NOT_STARTED = 4;
+    private static final int ALL_COMPLETE = INNER_COMPLETE | OUTER_COMPLETE;
 
-    private boolean strictMode = true;
     private Function<T, Flow.Publisher<X>> mapper;
-    private RequestedCounter requestCounter = new RequestedCounter(strictMode);
-    private RequestedCounter requestCounterUpstream = new RequestedCounter(strictMode);
-    private Flow.Subscriber<? super X> subscriber;
-    private Flow.Subscription subscription;
-    private volatile Flow.Subscription innerSubscription;
-    private volatile Flow.Publisher<X> innerPublisher;
-    private AtomicBoolean upstreamCompleted = new AtomicBoolean(false);
-    private Optional<Throwable> error = Optional.empty();
-    private ReentrantLock subscriptionLock = new ReentrantLock();
+    private final AtomicInteger active = new AtomicInteger(NOT_STARTED | INNER_COMPLETE);
+    private final Inner inner = new Inner();
 
+    private volatile Backpressure backp = new Backpressure(new Flow.Subscription() {
+            public void request(long n) {
+                if (n <= 0) {
+                    getSubscription().request(n); // let the Subscription deal with bad requests
+                    return;
+                }
+
+                int a;
+                do {
+                    a = active.get();
+                    if ((a & NOT_STARTED) == 0) {
+                        return;
+                    }
+                } while(!active.compareAndSet(a, a - NOT_STARTED));
+
+                getSubscription().request(1);
+            }
+
+            public void cancel() {}
+        });
 
     /**
      * Create new {@link MultiFlatMapProcessor}.
@@ -58,28 +76,7 @@ public class MultiFlatMapProcessor<T, X> implements Flow.Processor<T, X>, Multi<
      */
     protected MultiFlatMapProcessor(Function<T, Flow.Publisher<X>> mapper) {
         Objects.requireNonNull(mapper);
-        this.mapper = t -> (Flow.Publisher<X>) mapper.apply(t);
-    }
-
-    /**
-     * Set mapper used for publisher creation.
-     *
-     * @param mapper function used for publisher creation
-     * @return {@link MultiFlatMapProcessor}
-     */
-    protected MultiFlatMapProcessor<T, X> mapper(Function<T, Flow.Publisher<X>> mapper) {
-        Objects.requireNonNull(mapper);
         this.mapper = mapper;
-        return this;
-    }
-
-    /**
-     * Return received error if any.
-     *
-     * @return Optional with received error if any
-     */
-    protected Optional<Throwable> error() {
-        return this.error;
     }
 
     /**
@@ -106,170 +103,133 @@ public class MultiFlatMapProcessor<T, X> implements Flow.Processor<T, X>, Multi<
         return new MultiFlatMapProcessor<>(mapper);
     }
 
-    private class FlatMapSubscription implements Flow.Subscription {
-        @Override
-        public void request(long n) {
-            requestCounter.increment(n, MultiFlatMapProcessor.this::onError);
-            if (Objects.nonNull(innerSubscription) && Objects.nonNull(innerPublisher)) {
-                innerSubscription.request(n);
-            } else {
-                requestCounterUpstream.increment(1, MultiFlatMapProcessor.this::onError);
-                subscription.request(1);
-            }
-        }
-
-        @Override
-        public void cancel() {
-            subscription.cancel();
-            Optional.ofNullable(innerSubscription).ifPresent(Flow.Subscription::cancel);
-        }
-    }
-
-    @Override
-    public void subscribe(Flow.Subscriber<? super X> subscriber) {
-        subscriptionLock(() -> {
-            this.subscriber = SequentialSubscriber.create(subscriber);
-            if (Objects.nonNull(this.subscription)) {
-                this.subscriber.onSubscribe(new FlatMapSubscription());
-            }
-            error.ifPresent(this.subscriber::onError);
-        });
-    }
-
-    @Override
-    public void onSubscribe(Flow.Subscription subscription) {
-        subscriptionLock(() -> {
-            if (Objects.nonNull(this.subscription)) {
-                subscription.cancel();
-                return;
-            }
-            this.subscription = subscription;
-            if (Objects.nonNull(subscriber)) {
-                subscriber.onSubscribe(new FlatMapSubscription());
-            }
-        });
-    }
-
-    @Override
-    public void onNext(T o) {
-        Objects.requireNonNull(o);
-        requestCounterUpstream.tryDecrement();
-        try {
-            var mapperReturnedPublisher = mapper.apply(o);
-            if (Objects.isNull(mapperReturnedPublisher)) {
-                throw new IllegalStateException("Mapper returned a null value!");
-            }
-            subscriptionLock(() -> {
-                innerPublisher = mapperReturnedPublisher;
-                innerPublisher.subscribe(new InnerSubscriber());
-            });
-        } catch (Throwable t) {
-            subscription.cancel();
-            onError(t);
-        }
-    }
-
-    @Override
-    public void onError(Throwable t) {
-        this.error = Optional.of(t);
-        if (Objects.nonNull(subscriber)) {
-            subscriber.onError(t);
-        }
-    }
-
-    @Override
-    public void onComplete() {
-        upstreamCompleted.set(true);
-        subscriptionLock(() -> {
-            try {
-                requestCounter.lock();
-                if (requestCounter.get() == 0 || Objects.isNull(innerPublisher)) {
-                    //Have to wait for all Publishers to be finished
-                    subscriber.onComplete();
-                }
-            } finally {
-                requestCounter.unlock();
-            }
-        });
-    }
-
-    private class InnerSubscriber implements Flow.Subscriber<X> {
-        private AtomicBoolean alreadySubscribed = new AtomicBoolean(false);
-
-        @Override
-        public void onSubscribe(Flow.Subscription subscription) {
-            if (alreadySubscribed.getAndSet(true)) {
-                subscription.cancel();
-                return;
-            }
-            innerSubscription = subscription;
-            try {
-                requestCounter.lock();
-                if (requestCounter.get() > 0) {
-                    innerSubscription.request(requestCounter.get());
-                }
-            } finally {
-                requestCounter.unlock();
-            }
-        }
-
-        @Override
-        public void onNext(X item) {
-            Objects.requireNonNull(item);
-            if (requestCounter.tryDecrement()) {
-                subscriber.onNext(item);
-            } else {
-                onError(new IllegalStateException("Not enough request to submit item"));
-            }
-        }
-
-        @Override
-        public void onError(Throwable throwable) {
-            Objects.requireNonNull(throwable);
-            subscription.cancel();
-            subscriber.onError(throwable);
-        }
-
-        @Override
-        public void onComplete() {
-            if (upstreamCompleted.get()) {
-                subscriber.onComplete();
-                return;
-            }
-            subscriptionLock(() -> {
-                innerPublisher = null;
-            });
-            try {
-                requestCounter.lock();
-                try {
-                    requestCounterUpstream.lock();
-
-                    if (requestCounter.get() > 0 && requestCounterUpstream.get() == 0) {
-                        requestCounterUpstream.increment(1, MultiFlatMapProcessor.this::onError);
-                        subscription.request(1);
-                    }
-                } finally {
-                    requestCounterUpstream.unlock();
-                }
-            } finally {
-                requestCounter.unlock();
-            }
-        }
-    }
 
     /**
-     * Protect critical sections when working with states of innerPublisher.
+     * Set mapper used for publisher creation.
+     *
+     * @param mapper function used for publisher creation
+     * @return {@link MultiFlatMapProcessor}
      */
-    private void subscriptionLock(Runnable runnable) {
-        if (!strictMode) {
-            runnable.run();
+    protected MultiFlatMapProcessor<T, X> mapper(Function<T, Flow.Publisher<X>> mapper) {
+        Objects.requireNonNull(mapper);
+        this.mapper = mapper;
+        return this;
+    }
+
+    protected void submit(T item) {
+        active.set(0); // clear INNER_COMPLETE, if set; no other flags are set
+        mapper.apply(item).subscribe(inner);
+    }
+
+    protected void complete(Throwable th) {
+        setError(th);
+        super.cancel();
+
+        int a;
+        do {
+           a = active.get();
+        } while(!active.compareAndSet(a, a | OUTER_COMPLETE));
+
+        // the one who sets the second bit in ALL_COMPLETE must call super.complete
+        // bit masking, because maybe also NOT_STARTED
+        if ((a & ALL_COMPLETE) == INNER_COMPLETE) {
+            super.complete(th);
             return;
         }
-        try {
-            subscriptionLock.lock();
-            runnable.run();
-        } finally {
-            subscriptionLock.unlock();
+    }
+
+    public void request(long n) {
+        while(!backp.maybeRequest(n));
+    }
+
+    public void cancel() {
+        backp.cancel();
+        super.cancel();
+    }
+
+    protected static class Backpressure {
+        protected final AtomicLong requested = new AtomicLong(0);
+        protected final Flow.Subscription sub;
+
+        public Backpressure(Flow.Subscription sub) {
+            this.sub = sub;
+        }
+
+        public boolean maybeRequest(long n) {
+            if (n <= 0) {
+                sub.request(n); // let the Subscription deal with bad requests
+                return true;
+            }
+
+            long r;
+            do {
+                r = requested.get();
+                if (r < 0) {
+                    return false;
+                }
+            } while(!requested.compareAndSet(r, Long.MAX_VALUE - r > n ? r + n: Long.MAX_VALUE));
+            sub.request(n);
+            return true;
+        }
+
+        public void deliver() {
+            long r;
+            do {
+                r = requested.get();
+            } while(r != Long.MAX_VALUE && !requested.compareAndSet(r, r-1));
+        }
+
+        public long terminate() {
+            return requested.getAndSet(-1);
+        }
+
+        public void cancel() {
+            sub.cancel();
+        }
+    }
+
+    protected class Inner implements Flow.Subscriber<X> {
+        public void onSubscribe(Flow.Subscription sub) {
+            Backpressure old = backp;
+            backp = new Backpressure(sub);
+            long unused = old.terminate();
+
+            if (unused == 0) {
+                return;
+            }
+
+            request(unused);
+        }
+
+        public void onNext(X item) {
+            backp.deliver();
+            MultiFlatMapProcessor.this.subscriber.onNext(item);
+        }
+
+        public void onError(Throwable th) {
+            // the one who sets the second bit in ALL_COMPLETE must call super.complete
+            // set always succeeds to do this; should not wait for upstream to complete
+            // i.e. it may be that active is either 0 or OUTER_COMPLETE;
+            // MultiFlatMapProcessor.complete cannot enter super.complete, because it
+            // cannot see INNER_COMPLETE set; and when it does, it will see both bits
+            // are set.
+            active.set(ALL_COMPLETE);
+            MultiFlatMapProcessor.super.complete(th);
+        }
+
+        public void onComplete() {
+            int a;
+            do {
+               a = active.get();
+            } while(!active.compareAndSet(a, a | INNER_COMPLETE));
+
+            // the one who sets the second bit in ALL_COMPLETE must call super.complete
+            if (a == OUTER_COMPLETE) {
+                MultiFlatMapProcessor.super.complete(getError());
+                return;
+            }
+
+            MultiFlatMapProcessor.this.getSubscription().request(1);
         }
     }
 }
