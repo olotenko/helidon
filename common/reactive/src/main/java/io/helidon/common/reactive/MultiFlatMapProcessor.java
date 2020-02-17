@@ -125,10 +125,15 @@ public class MultiFlatMapProcessor<T, X> extends BaseProcessor<T, X> implements 
         setError(th);
         super.cancel();
 
-        int a;
-        do {
-           a = active.get();
-        } while(!active.compareAndSet(a, a | OUTER_COMPLETE));
+        // NOT_STARTED may still be set, but no need to preserve it - it is safe to treat
+        // all requests as no-op from this point on.
+        //
+        // if INNER_COMPLETE was set, no one is racing to observe INNER_COMPLETE;
+        // if INNER_COMPLETE was not set, no need to preserve it.
+        // OUTER_COMPLETE may have been set by inner onError, so check OUTER_COMPLETE
+        // is not set.
+        // it is ok to getAndSet
+        int a = active.getAndSet(OUTER_COMPLETE);
 
         // the one who sets the second bit in ALL_COMPLETE must call super.complete
         // bit masking, because maybe also NOT_STARTED
@@ -207,6 +212,8 @@ public class MultiFlatMapProcessor<T, X> extends BaseProcessor<T, X> implements 
         }
 
         public void onError(Throwable th) {
+            // NOT_STARTED is clear.
+            //
             // the one who sets the second bit in ALL_COMPLETE must call super.complete
             // set always succeeds to do this; should not wait for upstream to complete
             // i.e. it may be that active is either 0 or OUTER_COMPLETE;
@@ -218,10 +225,12 @@ public class MultiFlatMapProcessor<T, X> extends BaseProcessor<T, X> implements 
         }
 
         public void onComplete() {
-            int a;
-            do {
-               a = active.get();
-            } while(!active.compareAndSet(a, a | INNER_COMPLETE));
+            // NOT_STARTED is clear.
+            //
+            // if OUTER_COMPLETE is set, there will be no one to observe OUTER_COMPLETE;
+            // if OUTER_COMPLETE is not set, not preserving OUTER_COMPLETE is ok.
+            // So it is ok to getAndSet
+            int a = active.getAndSet(INNER_COMPLETE);
 
             // the one who sets the second bit in ALL_COMPLETE must call super.complete
             if (a == OUTER_COMPLETE) {
