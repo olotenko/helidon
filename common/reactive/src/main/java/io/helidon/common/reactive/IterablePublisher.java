@@ -106,13 +106,15 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
 
             try {
                 boolean hasNext;
-                while ((hasNext = iterator.hasNext()) && r > 0) {
+                long nexted = 0;
+                while ((hasNext = iterator.hasNext()) && nexted < requestCounter.get()) {
                     T next = iterator.next();
                     Objects.requireNonNull(next);
                     subscriber.onNext(next);
-                    r = requestCounter.decrementAndGet();
+                    nexted++;
                 }
 
+                r = requestCounter.getAndAdd(-nexted);
                 if (r < 0) {
                     // cancel or error
                     if (error != null) {
