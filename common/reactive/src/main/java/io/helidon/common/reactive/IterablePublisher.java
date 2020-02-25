@@ -29,10 +29,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * @param <T> item type
  */
 class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
-    private final Iterator<T> iterator;
-    private final AtomicBoolean trampolineLock = new AtomicBoolean(false);
+    private Iterator<T> iterator;
+    private final AtomicBoolean subscriberLock = new AtomicBoolean(false);
     private final AtomicLong requestCounter = new AtomicLong(0);
-    private Throwable error;
+    private volatile Throwable error;
     private Flow.Subscriber<? super T> subscriber;
 
     private IterablePublisher(Iterator<T> it) {
@@ -49,7 +49,12 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
     static <T> Flow.Publisher<T> create(Iterable<T> iterable) {
         Flow.Publisher<T> instance;
         try {
-            instance = new IterablePublisher<>(iterable.iterator());
+            Iterator<T> it = iterable.iterator();
+            if (!it.hasNext()) {
+                return MultiEmpty.instance();
+            }
+
+            instance = new IterablePublisher<>(it);
         } catch(Throwable th) {
             instance = MultiError.create(th);
         }
@@ -58,31 +63,24 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
 
     @Override
     public void subscribe(Flow.Subscriber<? super T> subscriber) {
-        boolean contended = trampolineLock.getAndSet(true);
+        boolean contended = subscriberLock.getAndSet(true);
 
-        if (contended || this.subscriber != null) {
-            if (!contended) {
-                trampolineLock.set(false);
-                trySubmit();
-            }
-
+        if (contended) {
             subscriber.onSubscribe(EmptySubscription.INSTANCE);
             subscriber.onError(new IllegalStateException("This Publisher supports only one Subscriber"));
             return;
         }
 
-        subscriber.onSubscribe(this);
         this.subscriber = subscriber;
-        trampolineLock.set(false);
-        trySubmit();
+        subscriber.onSubscribe(this);
     }
 
     @Override
     public void request(long n) {
         if (n <= 0) {
-           error = new IllegalArgumentException("Expecting positive request, got " + n);
-           requestCounter.getAndSet(-1);
-           trySubmit();
+           Throwable tmp = new IllegalArgumentException("Expecting positive request, got " + n);
+           error = tmp;
+           trySubmit(requestCounter.getAndSet(-1));
            return;
         }
 
@@ -94,44 +92,59 @@ class IterablePublisher<T> implements Flow.Publisher<T>, Flow.Subscription {
            }
         } while(!requestCounter.compareAndSet(r, Long.MAX_VALUE - r > n ? r + n: Long.MAX_VALUE));
 
-        trySubmit();
+        trySubmit(r);
     }
 
-    private void trySubmit() {
-        long r;
-        while((r = requestCounter.get()) != 0) {
-            if (trampolineLock.get() || trampolineLock.getAndSet(true)) {
-                return;
+    private void trySubmit(long lastSeen) {
+        if (lastSeen != 0) {
+            // assert: all updates to requestCounter outside trySubmit are followed by trySubmit, when on* signals are expected
+            // assert: when lastSeen != 0, it means some trySubmit has not reached the line
+            //         updating requestCounter - only that line can reduce it to 0
+            //         all other changes either make it negative, or increment positive values.
+            return;
+        }
+
+
+        try {
+            long nexted;
+            do {
+               // assert: requestCounter.get() is never 0
+               for (nexted = 0; nexted < requestCounter.get(); nexted++) {
+                   // assert: iterator.hasNext() has been seen true
+                   //         see Multi.from(...) - IterablePublisher is created only for iterators
+                   //         that hasNext; this loop also checks hasNext() before allowing further onNext
+                   T next = iterator.next();
+                   Objects.requireNonNull(next);
+                   subscriber.onNext(next);
+
+                   if (!iterator.hasNext()) {
+                      iterator = null;
+                      subscriber.onComplete();
+                      return;
+                   }
+               }
+
+               // assert: no positive values of nexted can overflow subtraction back to a positive
+               //         number, even if requestCounter == -1 - so concurrent updaters can't observe
+               //         a positive number after a negative number has been set once
+               lastSeen = requestCounter.addAndGet(-nexted);
+            } while(lastSeen > 0);
+
+            // cancel, error, or no more requests
+            if (lastSeen < 0) {
+                // assert: if lastSeen == 0, then non-null error indicates there is a future invocation of
+                //         trySubmit that will throw; so need to clean up iterator reference and observe
+                //         error only if there has been a request or cancel before requestCounter update by
+                //         trySubmit
+                iterator = null;
+                if (error != null) {
+                    throw error;
+                }
             }
-
-            try {
-                boolean hasNext;
-                long nexted = 0;
-                while ((hasNext = iterator.hasNext()) && nexted < requestCounter.get()) {
-                    T next = iterator.next();
-                    Objects.requireNonNull(next);
-                    subscriber.onNext(next);
-                    nexted++;
-                }
-
-                r = requestCounter.getAndAdd(-nexted);
-                if (r < 0) {
-                    // cancel or error
-                    if (error != null) {
-                        throw error;
-                    }
-                    return;
-                }
-
-                if (!hasNext) {
-                   subscriber.onComplete();
-                   return;
-                }
-            } catch (Throwable th) {
-                subscriber.onError(th);
-                return;
-            }
-            trampolineLock.set(false);
+        } catch (Throwable th) {
+            iterator = null;
+            subscriber.onError(th);
+            return;
         }
     }
 
