@@ -6,8 +6,6 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
    protected volatile boolean cancelled;
    protected volatile boolean completed;
 
-   protected static final Object EOF = new Object();
-
    public MultiFlatMapPublisher(Flow.Publisher<Flow.Publisher<X>> source,
                                 int maxConcurrency,
                                 int prefetch) {
@@ -54,13 +52,13 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
          }
       } while(!requested.compareAndSet(r, Long.MAX_VALUE - r <= n? Long.MAX_VALUE: r + n));
 
-      drain();
+      maybeDrain();
    }
 
    public void cancel() {
       cancelled = true;
       sub.cancel();
-      drain();
+      maybeDrain();
    }
 
    protected void cleanup() {
@@ -69,20 +67,27 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
          concurrentSubs.remove(s);
       }
 
-      // assert: InnerSubscribers will not add items that should have appeared after those
-      //         currently accessible via readReady.
-      readReady.clear(); // this does not eliminate the need for draining
+      readReady.clear();
    }
 
    protected void complete() {
       completed = true;
-      drain();
+      maybeDrain();
    }
 
    protected class InnerSubscriber implements Flow.Subscriber<X> {
       protected Flow.Subscription sub;
       protected int consumed;
-      protected ConcurrentLinkedQueue<X> innerQ = new ConcurrentLinkedQueue<>();
+      // assert: innerQ accesses to head and tail are singlethreaded;
+      // assert: put modifies tail, and uses of put ensure the cleanup of the queue
+      //         happens eventually, if cancellation has been requested concurrently
+      // assert: changes to tail.next become visible to the thread accessing head -
+      //         a happens-before edge is established by readReady.put -> readReady.empty
+      //         or concurrentSubs.put -> concurrentSubs.keySet
+      // assert: changes to tail become visible to the thread accessing tail - on* are serialized
+      // assert: empty, clear and poll do not modify tail; any concurrent changes to tail
+      //         will be observed: the method that will observe these changes is always invoked
+      protected InnerQueue<X> innerQ = new InnerQueue<>();
 
       public void cancel() {
          sub.cancel();
@@ -114,7 +119,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       protected void complete() {
          concurrentSubs.remove(this);
          awaitingTermination.getAndDecrement();
-         drain();
+         maybeDrain();
       }
 
       public void onNext(X item) {
@@ -122,19 +127,48 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
             return;
          }
 
+         boolean locked = tryLockDrain();
+         // assert: an atomic check for readReady.empty() is a sufficient condition for
+         //         FIFO order in the presence of out of bounds synchronization of concurrent
+         //         Publishers: if it becomes non-empty after the check, it is evidence
+         //         of the absence of such synchronization, in which case the items can be
+         //         delivered after this item
+         // assert: readReady.empty() implies innerQ.empty()
+         if (locked && readReady.empty() && !cancelled && requested.get() > 0) {
+            consumed();
+            downstream.onNext(item);
+            drain(1);
+            return;
+         }
+
          innerQ.put(item);
-         readReady.put(this);
-         drain();
+         // assert: drain() observing cancellation may have cleared concurrentSubs and
+         //         innerQ before an item has been added to innerQ - need to make sure
+         //         innerQ is cleared before the next exit from drain()
+         if (cancelled) {
+            concurrentSubs.put(this, this);
+         } else {
+            readReady.put(this);
+         }
+
+         if (locked) {
+            drain(0);
+         } else {
+            maybeDrain();
+         }
       }
 
-      public X poll() {
+      protected void consumed() {
          consumed++;
          if (consumed >= limit) {
             int p = consumed;
             consumed = 0;
             sub.request(p); // assert: if cancelled, no-op
          }
+      }
 
+      public X poll() {
+         consumed();
          return innerQ.poll();
       }
    }
@@ -147,7 +181,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       Node<X> tail;
 
       public InnerQueue() {
-         head = tail = new Node(null);
+         head = tail = new Node();
       }
 
       public void put(X item) {
@@ -172,6 +206,10 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
          head = tail;
          head.v = null;
       }
+
+      public boolean empty() {
+         return head.next == null;
+      }
    }
 
    public static class Node<X> {
@@ -179,14 +217,20 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       public Node<X> next;
    }
 
-   protected void drain() {
+   protected void maybeDrain() {
       if (drainLock.getAndIncrement() != 0) {
          return;
       }
+      drain(0);
+   }
 
-      for(int contenders = 1; contenders != 0; contenders = drainLock.addAndGet(-contenders)) {
-         long delivered;
-         for(delivered = 0; !cancelled && delivered < requested.get() && !readReady.empty();) {
+   protected boolean tryLockDrain() {
+      return drainLock.get() == 0 && drainLock.compareAndSet(0, 1);
+   }
+
+   protected void drain(long delivered) {
+      for(int contenders = 1; contenders != 0; contenders = drainLock.addAndGet(-contenders), delivered = 0) {
+         while(!cancelled && delivered < requested.get() && !readReady.empty()) {
             X value = readReady.poll().poll();
 
             if (value == null) {
