@@ -20,6 +20,9 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
    public void onSubscription(Flow.Subscription sub) {
       this.sub = sub;
       downstream.onSubscription(this);
+      if (!cancelled) {
+         sub.request(maxConcurrency);
+      }
    }
 
    public void onNext(Flow.Publisher<X> p) {
@@ -141,7 +144,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
             return;
          }
 
-         innerQ.put(item);
+         innerQ.putNotSafe(item);
          // assert: drain() observing cancellation may have cleared concurrentSubs and
          //         innerQ before an item has been added to innerQ - need to make sure
          //         innerQ is cleared before the next exit from drain()
@@ -177,21 +180,46 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
    // that put and poll are accessed single-threadedly, but not necessarily from the
    // same thread - i.e. put never touches head, and poll never touches tail.
    protected static class InnerQueue<X> {
-      Node<X> head;
-      Node<X> tail;
+      protected Node<X> head;
+      protected volatile Node<X> tail;
+
+      protected static final VarHandle<Node<X>> vhtail = new VarHandle(InnerQueue.class, "tail");
+      protected static final VarHandle<Node<X>> vhnext = new VarHandle(Node.class, "next");
 
       public InnerQueue() {
          head = tail = new Node();
       }
 
+      public void putNotSafe(X item) {
+         // assert: no concurrent calls to put() or putNotSafe()
+         Node<X> n = new Node<>();
+         n.v = item;
+         Node<X> t = tail;
+         vhnext.lazySet(t, n);
+         vhtail.lazySet(this, n);
+      }
+
       public void put(X item) {
          Node<X> n = new Node<>();
          n.v = item;
-         tail.next = n;
-         tail = n;
+         Node<X> t = tail;
+         Node<X> oldt = null;
+         do {
+            Node<X> newt = tail;
+            if (newt != oldt) {
+               oldt = newt;
+            }
+            while (t.next != null) {
+               t = t.next;
+            }
+         } while(!vhnext.compareAndSet(t, null, n));
+         // assert: ok to update it only sometimes - just subsequent put() will re-scan a bit more,
+         //         there is always a future put that succeeds to advance tail a bit
+         vhtail.compareAndSet(this, oldt, n);
       }
 
       public X poll() {
+         // assert: no concurrent calls to poll() or clear()
          Node<X> n = head.next;
          if (n == null) {
             return null;
@@ -203,8 +231,13 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       }
 
       public void clear() {
+         // assert: no concurrent calls to poll() or clear()
          head = tail;
          head.v = null;
+         // assert: if there is a concurrent put, no need to compete to update tail -
+         //         in these use cases no successful poll() is executed after clear(),
+         //         and concurrent updates of tail will result in a future call to clear()
+         vhnext.lazySet(head, null);
       }
 
       public boolean empty() {
@@ -214,7 +247,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
 
    public static class Node<X> {
       public X v;
-      public Node<X> next;
+      public volatile Node<X> next;
    }
 
    protected void maybeDrain() {
