@@ -2,15 +2,20 @@ package io.helidon.common.reactive;
 
 public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscription {
    protected ConcurrentLinkedQueue<InnerSubscriber> readReady = new ConcurrentLinkedQueue<>();
-   protected Throwable error;
-   protected volatile boolean cancelled;
-   protected volatile boolean completed;
+   protected volatile Throwable error;
+   protected boolean cancelled;
+   protected volatile boolean cancelPending;
+   protected boolean completed;
+   protected long delivered;
+   protected final boolean delayErrors;
 
    public MultiFlatMapPublisher(Flow.Publisher<Flow.Publisher<X>> source,
                                 int maxConcurrency,
-                                int prefetch) {
+                                int prefetch,
+                                boolean delayErrors) {
       this.maxConcurrency = maxConcurrency;
       this.prefetch = prefetch;
+      this.delayErrors = delayErrors;
    }
 
    public void subscribe(Flow.Subscriber<X> s) {
@@ -21,6 +26,10 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       this.sub = sub;
       downstream.onSubscription(this);
       if (!cancelled) {
+         // assert: there are cases not prescribed by the spec, but which require good hygiene:
+         //         if the flow is wired incorrectly, downstream may have been subscribed to
+         //         something already; and all they can do, is cancel. In these cases emitting
+         //         any signals to downstream would result in completely broken state machine.
          sub.request(maxConcurrency);
       }
    }
@@ -32,11 +41,20 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
 
    public void onError(Throwable th) {
       error = th;
+      if (!delayErrors) {
+         cancelPending = true;
+      }
+
       complete();
    }
 
    public void onComplete() {
       complete();
+   }
+
+   protected void complete() {
+      completed = true;
+      maybeDrain();
    }
 
    public void request(long n) {
@@ -60,22 +78,26 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
 
    public void cancel() {
       cancelled = true;
-      sub.cancel();
+      cancelPending = true;
       maybeDrain();
    }
 
    protected void cleanup() {
+      sub.cancel();
       for(InnerSubscriber s: concurrentSubs.keySet()) {
          s.cancel();
-         concurrentSubs.remove(s);
       }
+      // assert: concurrentSubs concurrent modification will ensure new InnerSubscribers are as good
+      //         as after s.cancel()
+      concurrentSubs.clear();
 
+      // assert: readReady modification is single-threaded
+      // assert: no downstream.onNext is reachable after this readReady.clear()
+      //         - it is called only after cancelPending is observed, and other
+      //         accesses either ensure they are single-threaded (own readReady),
+      //         or do not add to readReady, or will ensure cleanup() is called again
+      //         (will ensure drain() is called)
       readReady.clear();
-   }
-
-   protected void complete() {
-      completed = true;
-      maybeDrain();
    }
 
    protected class InnerSubscriber implements Flow.Subscriber<X> {
@@ -90,7 +112,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       // assert: changes to tail become visible to the thread accessing tail - on* are serialized
       // assert: empty, clear and poll do not modify tail; any concurrent changes to tail
       //         will be observed: the method that will observe these changes is always invoked
-      protected InnerQueue<X> innerQ = new InnerQueue<>();
+      protected final InnerQueue<X> innerQ = new InnerQueue<>();
 
       public void cancel() {
          sub.cancel();
@@ -100,7 +122,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       public void onSubscription(Flow.Subscription sub) {
          this.sub = sub;
          concurrentSubs.put(this, this);
-         if (cancelled) {
+         if (cancelPending) {
             sub.cancel();
             concurrentSubs.remove(this);
             return;
@@ -111,6 +133,10 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
 
       public void onError(Throwable th) {
          error = th;
+         if (!delayErrors) {
+            cancelPending = true;
+         }
+
          complete();
       }
 
@@ -126,7 +152,7 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       }
 
       public void onNext(X item) {
-         if (cancelled) {
+         if (cancelPending) {
             return;
          }
 
@@ -137,10 +163,11 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
          //         of the absence of such synchronization, in which case the items can be
          //         delivered after this item
          // assert: readReady.empty() implies innerQ.empty()
-         if (locked && readReady.empty() && !cancelled && requested.get() > 0) {
+         if (locked && readReady.empty() && !cancelPending && requested.get() > delivered) {
             consumed();
             downstream.onNext(item);
-            drain(1);
+            delivered++;
+            drain();
             return;
          }
 
@@ -148,14 +175,24 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
          // assert: drain() observing cancellation may have cleared concurrentSubs and
          //         innerQ before an item has been added to innerQ - need to make sure
          //         innerQ is cleared before the next exit from drain()
-         if (cancelled) {
-            concurrentSubs.put(this, this);
+         if (cancelPending) {
+            // assert: this line is reachable only in the presence of a cleanup() concurrent
+            //         with this onNext() - it will call this.cancel()
+            // assert: concurrent cleanup() will call innerQ.clear(); we don't need to contend
+            //         modifying head - just drop the item that has just been added
+            // assert: innerQ will at most reference two Nodes, but no items, after cleanup()
+            //         and this onNext complete
+            innerQ.clearTailNotSafe();
          } else {
+            // assert: if readReady is modified after readReady.clear() in cleanup(), then
+            //         the following drain() or maybeDrain() will make sure cleanup() is called
+            //         again - the item cannot be consumed out of order, because cleanup() is
+            //         called only after cancelPending becomes visible
             readReady.put(this);
          }
 
          if (locked) {
-            drain(0);
+            drain();
          } else {
             maybeDrain();
          }
@@ -199,16 +236,19 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
          vhtail.lazySet(this, n);
       }
 
+      public void clearTailNotSafe() {
+         // assert: no concurrent calls to poll() that can access this tail - even if
+         //         the queue is not cleared yet
+         tail.v = null;
+      }
+
       public void put(X item) {
          Node<X> n = new Node<>();
          n.v = item;
          Node<X> t = tail;
          Node<X> oldt = null;
          do {
-            Node<X> newt = tail;
-            if (newt != oldt) {
-               oldt = newt;
-            }
+            oldt = tail;
             while (t.next != null) {
                t = t.next;
             }
@@ -254,16 +294,19 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       if (drainLock.getAndIncrement() != 0) {
          return;
       }
-      drain(0);
+      drain();
    }
 
    protected boolean tryLockDrain() {
       return drainLock.get() == 0 && drainLock.compareAndSet(0, 1);
    }
 
-   protected void drain(long delivered) {
-      for(int contenders = 1; contenders != 0; contenders = drainLock.addAndGet(-contenders), delivered = 0) {
-         while(!cancelled && delivered < requested.get() && !readReady.empty()) {
+   protected void drain() {
+      // assert: all the concurrent changes of any variable of any object accessible from here will
+      //         result in a change of drainLock
+      for(int contenders = 1; contenders != 0; contenders = drainLock.addAndGet(-contenders)) {
+         boolean terminate = cancelPending;
+         while(!terminate && delivered < requested.get() && !readReady.empty()) {
             X value = readReady.poll().poll();
 
             if (value == null) {
@@ -272,19 +315,26 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
                downstream.onNext(value);
                delivered++;
             }
+
+            terminate = cancelPending;
          }
 
-         if (cancelled) {
+         if (terminate) {
             cleanup();
-            continue;
+            if (cancelled) {
+               continue;
+            }
          }
 
-         long r;
-         do {
-            r = requested.get();
-         } while(r != Long.MAX_VALUE && !requested.compareAndSet(r, r - delivered));
+         if (terminate || awaitingTermination.get() == 0 && completed) {
+            // assert: terminate == cancelPending is set in two cases:
+            //         - cancel() called - in this case this line is not reachable, because cancelled
+            //           is observed above
+            //         - eager error signalling has been requested - in this case
+            //           error is set, and downstream.onError is expected to be called;
+            //           after this will behave like cancel() called
+            cancelled = true;
 
-         if (awaitingTermination.get() == 0 && completed) {
             // assert: completed is a guarantee upstream is not producing
             //         any more signals - in particular, awaitingTermination will not increase
             // assert: awaitingTermination == 0 means all InnerSubscribers reached a terminal
@@ -296,9 +346,6 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
             } else {
                downstream.onComplete();
             }
-
-            // assert: system reached quiescent state - no reentry into drain() is expected
-            return;
          }
       }
    }
