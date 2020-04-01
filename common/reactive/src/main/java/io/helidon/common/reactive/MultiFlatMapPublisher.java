@@ -16,10 +16,10 @@
  */
 package io.helidon.common.reactive;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -34,6 +34,31 @@ import java.util.function.Function;
  * @param <R> the element type of the resulting and inner publishers
  */
 final class MultiFlatMapPublisher<T, R> implements Multi<R> {
+
+    protected static final VarHandle vherrors;
+    protected static final VarHandle vhtail;
+    protected static final VarHandle vhnext;
+
+    static {
+        VarHandle vh = null;
+        VarHandle vht = null;
+        VarHandle vhn = null;
+        try {
+            vh = MethodHandles.lookup().findVarHandle(FlatMapSubscriber.class,
+                                                   "errors",
+                                                   Throwable.class);
+            vht = MethodHandles.lookup().findVarHandle(InnerQueue.class,
+                                                   "tail",
+                                                   Node.class);
+            vhn = MethodHandles.lookup().findVarHandle(Node.class,
+                                                   "next",
+                                                   Node.class);
+        } catch(Exception e) {
+        }
+        vherrors = vh;
+        vhtail = vht;
+        vhnext = vhn;
+    }
 
     private final Multi<T> source;
 
@@ -73,21 +98,25 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
         private final long prefetch;
 
+        private final long limit;
+
         private final boolean delayErrors;
 
         private Flow.Subscription upstream;
 
-        private volatile boolean upstreamDone;
+        private volatile boolean cancelPending; // when should cancel any pending items and enter terminal state
 
-        private final AtomicReference<Throwable> errors;
+        protected volatile Throwable errors;
 
-        private volatile boolean canceled;
+        private boolean canceled; // when should enter terminal state, but eventually stop signalling downstream
 
-        private final ConcurrentMap<InnerSubscriber<R>, Object> subscribers;
+        private final ConcurrentMap<InnerSubscriber, Object> subscribers;
 
-        private final AtomicReference<Queue<InnerSubscriber<R>>> queue;
+        protected final InnerQueue<InnerSubscriber> readReady = new InnerQueue<>();
 
         private final AtomicLong requested;
+
+        private final AtomicLong awaitingTermination;
 
         private long emitted;
 
@@ -100,16 +129,17 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
             this.mapper = mapper;
             this.maxConcurrency = maxConcurrency;
             this.prefetch = prefetch;
+            this.limit = prefetch - (prefetch >> 2);
             this.delayErrors = delayErrors;
-            this.errors = new AtomicReference<>();
             this.subscribers = new ConcurrentHashMap<>();
-            this.queue = new AtomicReference<>();
             this.requested = new AtomicLong();
+            this.awaitingTermination = new AtomicLong(1);
         }
 
         @Override
         public void onSubscribe(Flow.Subscription subscription) {
             Objects.requireNonNull(subscription);
+            // FIXME: this is moot, because not atomic
             if (upstream != null) {
                 subscription.cancel();
                 throw new IllegalStateException("Subscription already set");
@@ -121,191 +151,90 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
         @Override
         public void onNext(T item) {
-            if (!upstreamDone) {
-                Flow.Publisher<? extends R> innerSource;
-
-                try {
-                    innerSource = Objects.requireNonNull(mapper.apply(item),
-                            "The mapper returned a null Publisher");
-                } catch (Throwable ex) {
-                    upstream.cancel();
-                    onError(ex);
-                    return;
-                }
-
-                InnerSubscriber<R> innerSubscriber = new InnerSubscriber<>(this, prefetch);
-                subscribers.put(innerSubscriber, innerSubscriber);
-                if (canceled) {
-                    subscribers.remove(innerSubscriber);
-                    return;
-                }
-
-                innerSource.subscribe(innerSubscriber);
+            if (cancelPending) {
+                return;
             }
+
+            Flow.Publisher<? extends R> innerSource;
+
+            try {
+                innerSource = Objects.requireNonNull(mapper.apply(item),
+                        "The mapper returned a null Publisher");
+            } catch (Throwable ex) {
+                setError(ex);
+                maybeDrain();
+                return;
+            }
+
+            awaitingTermination.getAndIncrement();
+            innerSource.subscribe(new InnerSubscriber());
         }
 
         @Override
         public void onError(Throwable throwable) {
-            if (!upstreamDone) {
-                doError(throwable);
-            }
+            setError(throwable);
+            complete();
+        }
+
+        protected void complete() {
+            awaitingTermination.getAndDecrement();
+            maybeDrain();
         }
 
         @Override
         public void onComplete() {
-            if (!upstreamDone) {
-                upstreamDone = true;
-                drain();
-            }
+            complete();
         }
 
-        void doError(Throwable throwable) {
+        void setError(Throwable throwable) {
             if (delayErrors) {
                 addError(throwable);
             } else {
-                errors.compareAndSet(null, throwable);
-                cancelInners();
+                vherrors.compareAndSet(this, null, throwable);
+                cancelPending = true;
             }
-            upstreamDone = true;
-
-            drain();
         }
 
         @Override
         public void request(long n) {
             if (n <= 0L) {
-                doError(new IllegalArgumentException("Rule §3.9 violated: non-positive request amount is forbidden"));
+                setError(new IllegalArgumentException("Rule §3.9 violated: non-positive request amount is forbidden"));
             } else {
                 SubscriptionHelper.addRequest(requested, n);
-                drain();
             }
+            maybeDrain();
         }
 
         @Override
         public void cancel() {
             canceled = true;
-            upstream.cancel();
-            cancelInners();
+            cancelPending = true;
+            maybeDrain();
         }
 
-        void cancelInners() {
-            for (InnerSubscriber<R> inner : subscribers.keySet()) {
+        protected void cleanup() {
+            upstream.cancel();
+            for (InnerSubscriber inner : subscribers.keySet()) {
                 inner.cancel();
             }
+            // assert: subscribers concurrent modification will ensure new InnerSubscribers are as good
+            //         as after s.cancel()
             subscribers.clear();
-        }
 
-        public void innerNext(R item, InnerSubscriber<R> sender) {
-            // fast enter into the serializer
-            if (get() == 0 && compareAndSet(0, 1)) {
-                long r = requested.get();
-                long e = emitted;
-                // is the downstream ready to receive an item
-                if (r != e) {
-                    Queue<InnerSubscriber<R>> q = queue.get();
-                    // are there prior items queued up?
-                    if (q == null || q.isEmpty()) {
-                        emitted = e + 1;
-                        downstream.onNext(item);
-                        sender.produced(1L);
-                    } else {
-                        // yes, go on a full drain loop
-                        drainLoop();
-                        return;
-                    }
-                } else {
-                    // downstream is not ready, queue up the work
-                    sender.enqueue(item);
-                    getOrCreateQueue().offer(sender);
-                }
-                // is there more work to be done?
-                if (decrementAndGet() == 0) {
-                    return;
-                }
-            } else {
-                sender.enqueue(item);
-                // queue up the item
-                getOrCreateQueue().offer(sender);
-                // can we enter the drain loop?
-                if (getAndIncrement() != 0) {
-                    return;
-                }
-            }
-            drainLoop();
-        }
-
-        public void innerError(Throwable ex, InnerSubscriber<R> sender) {
-            if (delayErrors) {
-                addError(ex);
-                sender.setDone();
-            } else {
-                errors.compareAndSet(null, ex);
-                upstream.cancel();
-                cancelInners();
-                sender.setDone();
-                upstreamDone = true;
-            }
-            getOrCreateQueue().offer(sender);
-            drain();
-        }
-
-        public void innerComplete(InnerSubscriber<R> sender) {
-            sender.setDone();
-            if (get() == 0 && compareAndSet(0, 1)) {
-
-                Queue<R> innerQueue = sender.getQueue();
-                if (innerQueue == null || innerQueue.isEmpty()) {
-                    subscribers.remove(sender);
-
-                    boolean done = upstreamDone;
-                    Queue<InnerSubscriber<R>> mainQueue = queue.get();
-                    boolean mainQueueEmpty = mainQueue == null || mainQueue.isEmpty();
-                    boolean noMoreSubscribers = subscribers.isEmpty();
-
-                    if (done && mainQueueEmpty && noMoreSubscribers) {
-                        Throwable ex = errors.get();
-                        if (ex == null) {
-                            downstream.onComplete();
-                        } else {
-                            downstream.onError(ex);
-                        }
-                        canceled = true;
-                    } else {
-                        if (!done) {
-                            upstream.request(1L);
-                        }
-                    }
-                } else {
-                    getOrCreateQueue().offer(sender);
-                }
-                if (decrementAndGet() == 0) {
-                    return;
-                }
-            } else {
-                getOrCreateQueue().offer(sender);
-                if (getAndIncrement() != 0) {
-                    return;
-                }
-            }
-            drainLoop();
-        }
-
-        Queue<InnerSubscriber<R>> getOrCreateQueue() {
-            Queue<InnerSubscriber<R>> q = queue.get();
-            if (q == null) {
-                q = new ConcurrentLinkedQueue<>();
-                if (!queue.compareAndSet(null, q)) {
-                    q = queue.get();
-                }
-            }
-            return q;
+            // assert: readReady modification is single-threaded
+            // assert: no downstream.onNext is reachable after this readReady.clear()
+            //         - it is called only after cancelPending is observed, and other
+            //         accesses either ensure they are single-threaded (own readReady),
+            //         or do not add to readReady, or will ensure cleanup() is called again
+            //         (will ensure drain() is called)
+            readReady.clear();
         }
 
         void addError(Throwable throwable) {
             for (;;) {
-                Throwable ex = errors.get();
+                Throwable ex = errors;
                 if (ex == null) {
-                    if (errors.compareAndSet(null, throwable)) {
+                    if (vherrors.compareAndSet(this, null, throwable)) {
                         return;
                     }
                 } else if (ex instanceof FlatMapAggregateException) {
@@ -315,94 +244,66 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                     Throwable newEx = new FlatMapAggregateException();
                     newEx.addSuppressed(ex);
                     newEx.addSuppressed(throwable);
-                    if (errors.compareAndSet(ex, newEx)) {
+                    if (vherrors.compareAndSet(this, ex, newEx)) {
                         return;
                     }
                 }
             }
         }
 
-        void drain() {
+        protected void maybeDrain() {
             if (getAndIncrement() == 0) {
-                drainLoop();
+                drain();
             }
         }
 
-        void drainLoop() {
+        protected boolean tryLockDrain() {
+            return get() == 0 && compareAndSet(0, 1);
+        }
 
-            int missed = 1;
+        protected void drain() {
+            // assert: all the concurrent changes of any variable of any object accessible from here will
+            //         result in a change of drain lock
+            for(int contenders = 1; contenders != 0; contenders = addAndGet(-contenders)) {
+                boolean terminate = cancelPending;
+                while(!terminate && emitted < requested.get() && !readReady.empty()) {
+                    R value = readReady.poll().poll();
 
-            long r = requested.get();
-            long e = emitted;
-
-            Flow.Subscriber<? super R> downstream = this.downstream;
-            AtomicReference<Queue<InnerSubscriber<R>>> queue = this.queue;
-            ConcurrentMap<?, ?> subscribers = this.subscribers;
-
-            for (;;) {
-
-                if (canceled) {
-                    queue.lazySet(null);
-                    subscribers.clear();
-                } else {
-                    if (!delayErrors) {
-                        Throwable ex = errors.get();
-                        if (ex != null) {
-                            canceled = true;
-                            downstream.onError(ex);
-                            continue;
-                        }
+                    if (value == null) {
+                        upstream.request(1L);
+                    } else {
+                        downstream.onNext(value);
+                        emitted++;
                     }
 
-                    boolean done = upstreamDone;
-                    boolean noActiveInnerSubscribers = subscribers.isEmpty();
-                    Queue<InnerSubscriber<R>> q = queue.get();
-                    boolean noQueuedItems = q == null || q.isEmpty();
+                    terminate = cancelPending;
+                }
 
-                    if (done && noActiveInnerSubscribers && noQueuedItems) {
-                        canceled = true;
-                        Throwable ex = errors.get();
-                        if (ex != null) {
-                            downstream.onError(ex);
-                        } else {
-                            downstream.onComplete();
-                        }
+                if (terminate) {
+                    cleanup();
+                    if (canceled) {
                         continue;
                     }
+                }
 
-                    if (!noQueuedItems) {
-                        InnerSubscriber<R> inner = q.peek();
+                if (terminate || awaitingTermination.get() == 0 && readReady.empty()) {
+                    // assert: terminate == cancelPending is set in two cases:
+                    //         - cancel() called - in this case this line is not reachable, because cancelled
+                    //           is observed above
+                    //         - eager error signalling has been requested - in this case
+                    //           error is set, and downstream.onError is expected to be called;
+                    //           after this will behave like cancel() called
+                    // assert: if awaitingTermination == 0, no more items will be added to readReady; if
+                    //         readReady becomes empty, should signal the terminal state
+                    canceled = true;
+                    cancelPending = true;
 
-                        boolean innerDone = inner.isDone();
-                        Queue<R> innerQueue = inner.getQueue();
-                        boolean innerEmpty = innerQueue == null || innerQueue.isEmpty();
-
-                        if (innerDone && innerEmpty) {
-                            subscribers.remove(inner);
-                            q.poll();
-                            upstream.request(1L);
-                            continue;
-                        }
-
-                        if (!innerEmpty) {
-                            if (r != e) {
-                                q.poll();
-                                R v = innerQueue.poll();
-                                e++;
-                                downstream.onNext(v);
-                                inner.produced(1L);
-                                continue;
-                            }
-                        }
+                    if (errors != null) {
+                        downstream.onError(errors);
+                    } else {
+                        downstream.onComplete();
                     }
                 }
-
-                emitted = e;
-                missed = addAndGet(-missed);
-                if (missed == 0) {
-                    break;
-                }
-                r = requested.get();
             }
         }
 
@@ -411,116 +312,142 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
          * Publishers and calls back to the enclosing parent class.
          * @param <R> the element type of the inner sequence
          */
-        static final class InnerSubscriber<R>
-                extends AtomicReference<Flow.Subscription>
-                implements Flow.Subscriber<R>, Flow.Subscription {
-
-            private final FlatMapSubscriber<?, R> parent;
-
-            private final long prefetch;
-
-            private final long limit;
+        final class InnerSubscriber
+                implements Flow.Subscriber<R> {
+            private Flow.Subscription sub;
 
             private long produced;
 
-            private volatile boolean done;
-
-            private volatile Queue<R> queue;
-
-            InnerSubscriber(FlatMapSubscriber<?, R> parent, long prefetch) {
-                this.parent = parent;
-                this.prefetch = prefetch;
-                this.limit = prefetch - (prefetch >> 2);
-            }
+            // assert: innerQ accesses to head and tail are singlethreaded;
+            // assert: put modifies tail, and uses of put ensure the cleanup of the queue
+            //         happens eventually, if cancellation has been requested concurrently
+            // assert: changes to tail.next become visible to the thread accessing head -
+            //         a happens-before edge is established by readReady.put -> readReady.empty
+            //         or subscribers.put -> subscribers.keySet
+            // assert: changes to tail become visible to the thread accessing tail - on* are serialized
+            // assert: empty, clear and poll do not modify tail; any concurrent changes to tail
+            //         will be observed: the method that will observe these changes is always invoked
+            private final InnerQueue<R> innerQ = new InnerQueue<>();
 
             @Override
             public void onSubscribe(Flow.Subscription subscription) {
                 Objects.requireNonNull(subscription, "subscription is null");
-                for (;;) {
-                    Flow.Subscription current = get();
-                    if (current == this) {
-                        subscription.cancel();
+                boolean first = subscribers.putIfAbsent(this, this) == null;
+                if (!first || cancelPending) {
+                    subscription.cancel();
+                    if (first) {
+                        subscribers.remove(this);
                         return;
                     }
-                    if (current != null) {
-                        subscription.cancel();
-                        throw new IllegalStateException("Subscription already set!");
-                    }
-                    if (compareAndSet(null, subscription)) {
-                        subscription.request(prefetch);
-                        return;
-                    }
+                    throw new IllegalStateException("Subscription already set!");
                 }
+                this.sub = subscription;
+                // assert: the cancellation loop will observe this subscriber
+                subscription.request(prefetch);
             }
 
             @Override
             public void onNext(R item) {
-                parent.innerNext(item, this);
+                if (cancelPending) {
+                    return;
+                }
+
+                boolean locked = tryLockDrain();
+                // assert: an atomic check for readReady.empty() is a sufficient condition for
+                //         FIFO order in the presence of out of bounds synchronization of concurrent
+                //         Publishers: if it becomes non-empty after the check, it is evidence
+                //         of the absence of such synchronization, in which case the items can be
+                //         delivered after this item
+                // assert: readReady.empty() implies innerQ.empty()
+                if (locked && readReady.empty() && !cancelPending && requested.get() > emitted) {
+                    produced(1L);
+                    downstream.onNext(item);
+                    emitted++;
+                    drain();
+                    return;
+                }
+
+                innerQ.putNotSafe(item);
+                // assert: drain() observing cancellation may have cleared concurrentSubs and
+                //         innerQ before an item has been added to innerQ - need to make sure
+                //         innerQ is cleared before the next exit from drain()
+                if (cancelPending) {
+                    // assert: this line is reachable only in the presence of a cleanup() concurrent
+                    //         with this onNext() - it will call this.cancel()
+                    // assert: concurrent cleanup() will call innerQ.clear(); we don't need to contend
+                    //         modifying head - just drop the item that has just been added
+                    // assert: innerQ will at most reference two Nodes, but no items, after cleanup()
+                    //         and this onNext complete
+                    innerQ.clearTailNotSafe();
+                } else {
+                    // assert: if readReady is modified after readReady.clear() in cleanup(), then
+                    //         the following drain() or maybeDrain() will make sure cleanup() is called
+                    //         again - the item cannot be consumed out of order, because cleanup() is
+                    //         called only after cancelPending becomes visible
+                    readReady.put(this);
+                }
+
+                if (locked) {
+                    drain();
+                } else {
+                    maybeDrain();
+                }
             }
 
             @Override
             public void onError(Throwable throwable) {
-                lazySet(this);
-                parent.innerError(throwable, this);
+                setError(throwable);
+                complete();
+            }
+
+            protected void complete() {
+                subscribers.remove(this);
+                awaitingTermination.getAndDecrement();
+
+                boolean locked = !cancelPending && innerQ.empty() && tryLockDrain();
+                if (locked) {
+                    upstream.request(1L);
+                    drain();
+                    return;
+                }
+
+                readReady.put(this);
+                maybeDrain();
             }
 
             @Override
             public void onComplete() {
-                lazySet(this);
-                parent.innerComplete(this);
-            }
-
-            @Override
-            public void request(long n) {
-                // deliberately empty
+                complete();
             }
 
             public void produced(long n) {
                 long p = produced + n;
                 if (p >= limit) {
                     produced = 0L;
-                    get().request(p);
+                    sub.request(p);
                 } else {
                     produced = p;
                 }
             }
 
-            @Override
             public void cancel() {
-                Flow.Subscription s = getAndSet(this);
-                if (s != null && s != this) {
-                    s.cancel();
+                if (sub == null) {
+                    return;
                 }
+                sub.cancel();
+                innerQ.clear();
             }
 
-            public Queue<R> getQueue() {
-                return queue;
-            }
-
-            public void enqueue(R item) {
-                Queue<R> q = queue;
-                if (q == null) {
-                    q = new ConcurrentLinkedQueue<>();
-                    queue = q;
-                }
-                q.offer(item);
-            }
-
-            public void setDone() {
-                done = true;
-            }
-
-            public boolean isDone() {
-                return done;
+            public R poll() {
+                produced(1L);
+                return innerQ.poll();
             }
 
             @Override
             public String toString() {
-                boolean d = done;
-                Queue<R> q = queue;
                 return "InnerSubscriber{"
-                        + "done=" + d
-                        + ", queue=" + (q != null ? q.size() : "null")
+                        + "cancelPending=" + cancelPending
+                        + ", innerQ.empty=" + (innerQ.empty())
                         + '}';
             }
         }
@@ -535,5 +462,79 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
         public synchronized Throwable fillInStackTrace() {
             return this; // No stacktrace of its own as it aggregates other exceptions
         }
+    }
+
+    // there probably is already a j.u.Queue that fits the bill, but need a guarantee
+    // that put and poll are accessed single-threadedly, but not necessarily from the
+    // same thread - i.e. put never touches head, and poll never touches tail.
+    protected static class InnerQueue<X> {
+        protected Node<X> head;
+        protected volatile Node<X> tail;
+
+        public InnerQueue() {
+            head = tail = new Node<>();
+        }
+
+        public void putNotSafe(X item) {
+            // assert: no concurrent calls to put() or putNotSafe()
+            Node<X> n = new Node<>();
+            n.v = item;
+            Node<X> t = tail;
+            vhnext.set(t, n);
+            vhtail.set(this, n);
+        }
+
+        public void clearTailNotSafe() {
+            // assert: no concurrent calls to poll() that can access this tail - even if
+            //         the queue is not cleared yet
+            tail.v = null;
+        }
+
+        public void put(X item) {
+            Node<X> n = new Node<>();
+            n.v = item;
+            Node<X> t = tail;
+            Node<X> oldt = null;
+            do {
+                oldt = tail;
+                while (t.next != null) {
+                    t = t.next;
+                }
+            } while(!vhnext.compareAndSet(t, null, n));
+            // assert: ok to update it only sometimes - just subsequent put() will re-scan a bit more,
+            //         there is always a future put that succeeds to advance tail a bit
+            vhtail.compareAndSet(this, oldt, n);
+        }
+
+        public X poll() {
+            // assert: no concurrent calls to poll() or clear()
+            Node<X> n = head.next;
+            if (n == null) {
+                return null;
+            }
+            X v = n.v;
+            n.v = null;
+            head = n;
+            return v;
+        }
+
+        public void clear() {
+            // assert: no concurrent calls to poll() or clear()
+            head = tail;
+            head.v = null;
+            // assert: if there is a concurrent put, no need to compete to update tail -
+            //         in these use cases no successful poll() is executed after clear(),
+            //         and concurrent updates of tail will result in a future call to clear()
+            vhnext.set(head, null);
+        }
+
+        public boolean empty() {
+            return head.next == null;
+        }
+    }
+
+    public static class Node<X> {
+        public X v;
+        public volatile Node<X> next;
     }
 }
