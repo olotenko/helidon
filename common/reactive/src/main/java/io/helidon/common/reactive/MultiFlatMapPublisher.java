@@ -1,7 +1,7 @@
 package io.helidon.common.reactive;
 
 public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscription {
-   protected ConcurrentLinkedQueue<InnerSubscriber> readReady = new ConcurrentLinkedQueue<>();
+   protected final InnerQueue<InnerSubscriber> readReady = new InnerQueue<>();
    protected volatile Throwable error;
    protected boolean cancelled;
    protected volatile boolean cancelPending;
@@ -115,18 +115,23 @@ public class MultiFlatMapPublisher<X> implements Flow.Publisher<X>, Flow.Subscri
       protected final InnerQueue<X> innerQ = new InnerQueue<>();
 
       public void cancel() {
+         if (sub == null) {
+            return;
+         }
          sub.cancel();
          innerQ.clear();
       }
 
       public void onSubscription(Flow.Subscription sub) {
-         this.sub = sub;
-         concurrentSubs.put(this, this);
-         if (cancelPending) {
+         boolean first = concurrentSubs.putIfAbsent(this, this) == null;
+         if (!first || cancelPending) {
             sub.cancel();
-            concurrentSubs.remove(this);
+            if (first) {
+               concurrentSubs.remove(this);
+            }
             return;
          }
+         this.sub = sub;
          // assert: the cancellation loop will observe this subscriber
          sub.request(prefetch);
       }
