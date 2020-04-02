@@ -116,7 +116,7 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
         private final AtomicLong requested;
 
-        private final AtomicLong awaitingTermination;
+        private final AtomicInteger awaitingTermination;
 
         private long emitted;
 
@@ -133,14 +133,13 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
             this.delayErrors = delayErrors;
             this.subscribers = new ConcurrentHashMap<>();
             this.requested = new AtomicLong();
-            this.awaitingTermination = new AtomicLong(1);
+            this.awaitingTermination = new AtomicInteger();
         }
 
         @Override
         public void onSubscribe(Flow.Subscription subscription) {
             Objects.requireNonNull(subscription);
-            // FIXME: this is moot, because not atomic
-            if (upstream != null) {
+            if (!awaitingTermination.compareAndSet(0, 1)) {
                 subscription.cancel();
                 throw new IllegalStateException("Subscription already set");
             }
@@ -177,7 +176,8 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
         }
 
         protected void complete() {
-            awaitingTermination.getAndDecrement();
+            // assert: decrement awaitingTermination, and set the highest bit to 1
+            awaitingTermination.getAndAdd(Integer.MAX_VALUE);
             maybeDrain();
         }
 
@@ -266,15 +266,11 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
             //         result in a change of drain lock
             for(int contenders = 1; contenders != 0; contenders = addAndGet(-contenders)) {
                 boolean terminate = cancelPending;
-                while(!terminate && emitted < requested.get() && !readReady.empty()) {
-                    R value = readReady.poll().poll();
-
-                    if (value == null) {
-                        upstream.request(1L);
-                    } else {
-                        downstream.onNext(value);
-                        emitted++;
-                    }
+                while(!terminate && emitted < requested.get() && !empty()) {
+                    // assert: !empty() ensures all end-of-stream indications are removed from readReady -
+                    //         both poll() return non-null
+                    downstream.onNext(readReady.poll().poll());
+                    emitted++;
 
                     terminate = cancelPending;
                 }
@@ -286,7 +282,11 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                     }
                 }
 
-                if (terminate || awaitingTermination.get() == 0 && readReady.empty()) {
+                // assert: eager empty() check ensures readReady is either empty, or starts with an unconsumed
+                //         item
+                //         - new concurrent Publishers are requested timely
+                //         - terminating signal is eventually sent to downstream
+                if (terminate || empty() && awaitingTermination.get() == Integer.MIN_VALUE) {
                     // assert: terminate == cancelPending is set in two cases:
                     //         - cancel() called - in this case this line is not reachable, because cancelled
                     //           is observed above
@@ -305,6 +305,19 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                     }
                 }
             }
+        }
+
+        protected boolean empty() {
+            long ended = 0;
+            InnerSubscriber inner;
+            for (inner = readReady.peek(); inner != null && inner.peek() == null; inner = readReady.peek()) {
+                readReady.poll();
+                ended++;
+            }
+            if (ended > 0 && awaitingTermination.get() > 0) {
+                upstream.request(ended);
+            }
+            return inner == null;
         }
 
         /**
@@ -359,7 +372,7 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 //         of the absence of such synchronization, in which case the items can be
                 //         delivered after this item
                 // assert: readReady.empty() implies innerQ.empty()
-                if (locked && readReady.empty() && !cancelPending && requested.get() > emitted) {
+                if (locked && empty() && !cancelPending && requested.get() > emitted) {
                     produced(1L);
                     downstream.onNext(item);
                     emitted++;
@@ -443,6 +456,10 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 return innerQ.poll();
             }
 
+            public R peek() {
+                return innerQ.peek();
+            }
+
             @Override
             public String toString() {
                 return "InnerSubscriber{"
@@ -504,6 +521,11 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
             // assert: ok to update it only sometimes - just subsequent put() will re-scan a bit more,
             //         there is always a future put that succeeds to advance tail a bit
             vhtail.compareAndSet(this, oldt, n);
+        }
+
+        public X peek() {
+            Node<X> n = head.next;
+            return n == null? null: n.v;
         }
 
         public X poll() {
