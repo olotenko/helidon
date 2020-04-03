@@ -278,6 +278,7 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 if (terminate) {
                     cleanup();
                     if (canceled) {
+                        vherrors.set(this, null);
                         continue;
                     }
                 }
@@ -293,13 +294,15 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                     //         - eager error signalling has been requested - in this case
                     //           error is set, and downstream.onError is expected to be called;
                     //           after this will behave like cancel() called
-                    // assert: if awaitingTermination == 0, no more items will be added to readReady; if
-                    //         readReady becomes empty, should signal the terminal state
+                    // assert: awaitingTermination is decremented as the last thing Inner or outer Subscribers do;
+                    //         no further changes to readReady or errors, except request() with invalid input -
+                    //         so have to retain cancellation flags below
                     canceled = true;
                     cancelPending = true;
 
                     if (errors != null) {
                         downstream.onError(errors);
+                        vherrors.set(this, null);
                     } else {
                         downstream.onComplete();
                     }
@@ -372,11 +375,13 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 //         of the absence of such synchronization, in which case the items can be
                 //         delivered after this item
                 // assert: readReady.empty() implies innerQ.empty()
-                if (locked && empty() && !cancelPending && requested.get() > emitted) {
+                if (locked && readReady.empty() && !cancelPending && requested.get() > emitted) {
                     produced(1L);
                     downstream.onNext(item);
                     emitted++;
-                    drain();
+                    if (getAndDecrement() > 1) {
+                        drain();
+                    }
                     return;
                 }
 
@@ -415,16 +420,22 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
             protected void complete() {
                 subscribers.remove(this);
-                awaitingTermination.getAndDecrement();
 
+                // assert: it is safe to call empty() concurrently here, because either
+                //         we observe non-empty (no need to attempt lock), or it is
+                //         empty, and there are no concurrent modifiers that may change
+                //         that
                 boolean locked = !cancelPending && innerQ.empty() && tryLockDrain();
                 if (locked) {
-                    upstream.request(1L);
+                    if (awaitingTermination.getAndDecrement() > 0) {
+                        upstream.request(1L);
+                    }
                     drain();
                     return;
                 }
 
                 readReady.put(this);
+                awaitingTermination.getAndDecrement();
                 maybeDrain();
             }
 
