@@ -160,9 +160,9 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 innerSource = Objects.requireNonNull(mapper.apply(item),
                         "The mapper returned a null Publisher");
             } catch (Throwable ex) {
-                setError(ex);
-                maybeDrain();
-                return;
+                // proceed like inner subscriber received the error
+                // (and requests more, if ok to do so)
+                innerSource = MultiError.create(ex);
             }
 
             awaitingTermination.getAndIncrement();
@@ -171,6 +171,12 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
         @Override
         public void onError(Throwable throwable) {
+            if (cancelPending) {
+                // assert: atomic check of cancelPending is sufficient; we only need proof that any
+                //         terminal signals are not signalled out of order with (missing) onNext
+                return;
+            }
+
             setError(throwable);
             complete();
         }
@@ -183,6 +189,12 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
         @Override
         public void onComplete() {
+            if (cancelPending) {
+                // assert: atomic check of cancelPending is sufficient; we only need proof that any
+                //         terminal signals are not signalled out of order with (missing) onNext
+                return;
+            }
+
             complete();
         }
 
@@ -213,7 +225,9 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
         }
 
         protected void cleanup() {
-            upstream.cancel();
+            if (awaitingTermination.get() > 0) {
+                upstream.cancel();
+            }
             for (InnerSubscriber inner : subscribers.keySet()) {
                 inner.cancel();
             }
@@ -277,10 +291,6 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
                 if (terminate) {
                     cleanup();
-                    if (canceled) {
-                        vherrors.set(this, null);
-                        continue;
-                    }
                 }
 
                 // assert: eager empty() check ensures readReady is either empty, or starts with an unconsumed
@@ -288,6 +298,13 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 //         - new concurrent Publishers are requested timely
                 //         - terminating signal is eventually sent to downstream
                 if (terminate || empty() && awaitingTermination.get() == Integer.MIN_VALUE) {
+                    if (canceled) {
+                        vherrors.set(this, null);
+                        continue;
+                    }
+                    // assert: this line is reachable once and only once, and only if cancel() is not called
+                    canceled = true;
+
                     // assert: terminate == cancelPending is set in two cases:
                     //         - cancel() called - in this case this line is not reachable, because cancelled
                     //           is observed above
@@ -296,10 +313,7 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                     //           after this will behave like cancel() called
                     // assert: awaitingTermination is decremented as the last thing Inner or outer Subscribers do;
                     //         no further changes to readReady or errors, except request() with invalid input -
-                    //         so have to retain cancellation flags below
-                    canceled = true;
-                    cancelPending = true;
-
+                    //         request() will call maybeDrain() and cause the cleanup to occur above
                     if (errors != null) {
                         downstream.onError(errors);
                         vherrors.set(this, null);
@@ -348,16 +362,16 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
             @Override
             public void onSubscribe(Flow.Subscription subscription) {
                 Objects.requireNonNull(subscription, "subscription is null");
-                boolean first = subscribers.putIfAbsent(this, this) == null;
-                if (!first || cancelPending) {
+                if (subscribers.putIfAbsent(this, this) != null) {
                     subscription.cancel();
-                    if (first) {
-                        subscribers.remove(this);
-                        return;
-                    }
                     throw new IllegalStateException("Subscription already set!");
                 }
                 this.sub = subscription;
+                if (cancelPending) {
+                    subscription.cancel();
+                    subscribers.remove(this);
+                    return;
+                }
                 // assert: the cancellation loop will observe this subscriber
                 subscription.request(prefetch);
             }
@@ -414,6 +428,12 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
             @Override
             public void onError(Throwable throwable) {
+                if (cancelPending) {
+                    // assert: atomic check of cancelPending is sufficient; we only need proof that any
+                    //         terminal signals are not signalled out of order with (missing) onNext
+                    return;
+                }
+
                 setError(throwable);
                 complete();
             }
@@ -441,6 +461,12 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
 
             @Override
             public void onComplete() {
+                if (cancelPending) {
+                    // assert: atomic check of cancelPending is sufficient; we only need proof that any
+                    //         terminal signals are not signalled out of order with (missing) onNext
+                    return;
+                }
+
                 complete();
             }
 
