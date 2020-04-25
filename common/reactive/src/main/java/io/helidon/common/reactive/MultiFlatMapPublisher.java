@@ -279,8 +279,12 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
             // assert: all the concurrent changes of any variable of any object accessible from here will
             //         result in a change of drain lock
             for(int contenders = 1; contenders != 0; contenders = addAndGet(-contenders)) {
+                // assert: eager empty() check ensures readReady is either empty, or starts with an unconsumed
+                //         item
+                //         - new concurrent Publishers are requested timely
+                //         - terminating signal is eventually sent to downstream
                 boolean terminate = cancelPending;
-                while(!terminate && emitted < requested.get() && !empty()) {
+                while(!terminate && !empty() && emitted < requested.get()) {
                     // assert: !empty() ensures all end-of-stream indications are removed from readReady -
                     //         both poll() return non-null
                     downstream.onNext(readReady.poll().poll());
@@ -293,11 +297,9 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                     cleanup();
                 }
 
-                // assert: eager empty() check ensures readReady is either empty, or starts with an unconsumed
-                //         item
-                //         - new concurrent Publishers are requested timely
-                //         - terminating signal is eventually sent to downstream
-                if (terminate || empty() && awaitingTermination.get() == Integer.MIN_VALUE) {
+                // assert: awaitingTermination check ensures there are no readReady.put() in the future, subsequent
+                //         empty() check ensures there are no readReady.put() with no matching readReady.poll() in the past
+                if (terminate || awaitingTermination.get() == Integer.MIN_VALUE && empty()) {
                     if (canceled) {
                         vherrors.set(this, null);
                         continue;
@@ -389,7 +391,7 @@ final class MultiFlatMapPublisher<T, R> implements Multi<R> {
                 //         of the absence of such synchronization, in which case the items can be
                 //         delivered after this item
                 // assert: readReady.empty() implies innerQ.empty()
-                if (locked && readReady.empty() && !cancelPending && requested.get() > emitted) {
+                if (locked && !cancelPending && readReady.empty() && emitted < requested.get()) {
                     produced(1L);
                     downstream.onNext(item);
                     emitted++;
